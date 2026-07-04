@@ -1,0 +1,14 @@
+datasets/
+code/features/
+output/
+tmp/
+
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.hdf5
