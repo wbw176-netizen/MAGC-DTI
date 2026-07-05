@@ -86,8 +86,14 @@ class PreExtractedNpyDTIDataset(data.Dataset):
         use_chembert=True,
         indices=None,
     ):
-        if split not in ("train", "val", "test"):
-            raise ValueError(f"split must be train/val/test, got: {split}")
+        if (
+            not split
+            or os.path.basename(split) != split
+            or split in (".", "..")
+        ):
+            raise ValueError(
+                f"split must be a single directory name, got: {split}"
+            )
 
         self.split = split
         self.feature_dir = os.path.abspath(feature_dir)
