@@ -15,7 +15,6 @@ from utils import integer_label_protein
 
 
 class DTIDataset(data.Dataset):
-    """Raw SMILES/protein dataset used by the GCN + MSAA model."""
 
     def __init__(self, list_IDs, df, max_drug_nodes=300):
         self.list_IDs = list_IDs
@@ -76,7 +75,6 @@ class DTIDataset(data.Dataset):
 
 
 class PreExtractedNpyDTIDataset(data.Dataset):
-    """Load pooled NPY features or variable-length token HDF5 features."""
 
     def __init__(
         self,
@@ -293,7 +291,6 @@ class PreExtractedNpyDTIDataset(data.Dataset):
 
 
 class PreExtractedDTIDataset(PreExtractedNpyDTIDataset):
-    """Compatibility wrapper for the legacy CSV-indexed interface."""
 
     def __init__(
         self,
@@ -349,7 +346,6 @@ class MultiDataLoader:
 
 
 def pretrained_collate_func(batch):
-    """Collate pooled vectors or pad variable-length token sequences."""
 
     drug_feats, protein_feats, labels = zip(*batch)
 
