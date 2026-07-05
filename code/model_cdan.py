@@ -1,727 +1,571 @@
+import argparse
+import json
 import os
-import glob
+import random
+from pathlib import Path
+
+import dgl
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import pandas as pd
-import numpy as np
 from sklearn.metrics import (
-    roc_auc_score,
     accuracy_score,
+    average_precision_score,
     precision_score,
     recall_score,
-    average_precision_score
+    roc_auc_score,
 )
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader, Dataset
+
+from configs import get_cfg_defaults
+from dataloader import DTIDataset, PreExtractedNpyDTIDataset
+from domain_adaptator import Discriminator, ReverseLayerF
 from model import MAGC_DTI
-import dgl
-from rdkit import Chem
-import math
-import warnings
-from domain_adaptator import ReverseLayerF, Discriminator
-import argparse
 
 
-class RandomLayer(nn.Module):
-    def __init__(self, input_dim_list, output_dim=1024):
-        super(RandomLayer, self).__init__()
-        self.input_num = len(input_dim_list)
-        self.output_dim = output_dim
-        self.random_matrix = nn.ParameterList(
-            [
-                nn.Parameter(torch.randn(input_dim_list[i], output_dim), requires_grad=False)
-                for i in range(self.input_num)
-            ]
+CLUSTER_COLUMNS = ("drug_cluster", "target_cluster")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="MAGC-DTI with paper-aligned CDAN"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("default", "cross_domain"),
+        default="default",
+    )
+    parser.add_argument(
+        "--data_dir",
+        default="../datasets/bindingdb/cluster",
+        help="Directory containing CSV data and cluster annotations.",
+    )
+    parser.add_argument(
+        "--use_pretrained_features",
+        action="store_true",
+        help=(
+            "Use ChemBERTa/ESM-2 pooled NPY or token HDF5 features "
+            "instead of raw graphs and protein indices."
+        ),
+    )
+    parser.add_argument(
+        "--feature_dir",
+        default="../features/bindingdb",
+        help="Default root directory for pre-extracted features.",
+    )
+    parser.add_argument("--source_feature_dir", default=None)
+    parser.add_argument("--target_train_feature_dir", default=None)
+    parser.add_argument("--validation_feature_dir", default=None)
+    parser.add_argument("--target_test_feature_dir", default=None)
+
+    parser.add_argument("--train_split", default="train")
+    parser.add_argument("--val_split", default="val")
+    parser.add_argument("--test_split", default="test")
+    parser.add_argument("--source_split", default="source_train")
+    parser.add_argument("--target_train_split", default="target_train")
+    parser.add_argument("--validation_split", default="val")
+    parser.add_argument("--target_test_split", default="target_test")
+
+    parser.add_argument(
+        "--train_csv",
+        "--train_cluster_csv",
+        dest="train_csv",
+        default=None,
+    )
+    parser.add_argument(
+        "--val_csv",
+        "--val_cluster_csv",
+        dest="val_csv",
+        default=None,
+    )
+    parser.add_argument(
+        "--test_csv",
+        "--test_cluster_csv",
+        dest="test_csv",
+        default=None,
+    )
+    parser.add_argument(
+        "--source_csv",
+        "--source_cluster_csv",
+        dest="source_csv",
+        default=None,
+    )
+    parser.add_argument(
+        "--target_train_csv",
+        "--target_train_cluster_csv",
+        dest="target_train_csv",
+        default=None,
+    )
+    parser.add_argument(
+        "--validation_csv",
+        default=None,
+        help=(
+            "Held-out validation CSV. It is never used by the domain loss."
+        ),
+    )
+    parser.add_argument(
+        "--target_test_csv",
+        "--target_test_cluster_csv",
+        dest="target_test_csv",
+        default=None,
+    )
+    parser.add_argument(
+        "--validation_domain",
+        choices=("source", "target"),
+        default="source",
+        help="Domain membership of the held-out validation split.",
+    )
+
+    parser.add_argument("--lambda_domain", type=float, default=0.1)
+    parser.add_argument("--da_init_epoch", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_epochs", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--output_dir", default="./results")
+    parser.add_argument("--analyze_clusters", action="store_true")
+    return parser.parse_args()
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def resolve_csv(path, data_dir, split):
+    resolved = Path(path) if path else Path(data_dir) / f"{split}.csv"
+    if not resolved.is_file():
+        raise FileNotFoundError(f"CSV file not found: {resolved}")
+    return str(resolved)
+
+
+def read_metadata(csv_path, require_clusters):
+    frame = pd.read_csv(csv_path)
+    required = {"SMILES", "Protein", "Y"}
+    missing_data = required.difference(frame.columns)
+    if missing_data:
+        raise ValueError(
+            f"{csv_path} is missing required columns: "
+            f"{sorted(missing_data)}"
         )
 
-    def forward(self, input_list):
-        return_list = [torch.mm(input_list[i], self.random_matrix[i]) for i in range(self.input_num)]
-        return_tensor = return_list[0] / math.pow(float(self.output_dim), 1.0 / len(return_list))
-        for single in return_list[1:]:
-            return_tensor = torch.mul(return_tensor, single)
-        return return_tensor
-
-    def cuda(self):
-        return super(RandomLayer, self).cuda()
+    missing_clusters = set(CLUSTER_COLUMNS).difference(frame.columns)
+    if require_clusters and missing_clusters:
+        raise ValueError(
+            f"{csv_path} is missing cluster columns required for the "
+            f"paper cross-domain split: {sorted(missing_clusters)}"
+        )
+    return frame
 
 
-def prediction_probabilities(outputs):
-    positive = torch.sigmoid(torch.clamp(outputs.view(-1, 1), min=-30.0, max=30.0))
-    positive = torch.clamp(positive, min=1e-6, max=1.0 - 1e-6)
-    return torch.cat([1.0 - positive, positive], dim=1)
+class AnnotatedDTIDataset(Dataset):
+    """Add validated cluster metadata to a raw or pre-extracted dataset."""
 
+    def __init__(self, base_dataset, metadata, require_clusters=False):
+        self.base_dataset = base_dataset
+        self.metadata = metadata.reset_index(drop=True)
+        if len(self.base_dataset) != len(self.metadata):
+            raise ValueError(
+                f"Feature rows ({len(self.base_dataset)}) and metadata rows "
+                f"({len(self.metadata)}) do not match"
+            )
 
-def condition_domain_features(features, outputs, random_layer=None):
-    if features.dim() > 2:
-        features = features.view(features.size(0), -1)
+        missing = set(CLUSTER_COLUMNS).difference(self.metadata.columns)
+        if require_clusters and missing:
+            raise ValueError(
+                f"Cluster metadata is required; missing {sorted(missing)}"
+            )
+        self.has_clusters = not missing
 
-    probabilities = prediction_probabilities(outputs)
+        if hasattr(self.base_dataset, "_labels_full"):
+            indices = getattr(
+                self.base_dataset,
+                "indices",
+                np.arange(len(self.base_dataset)),
+            )
+            feature_labels = np.asarray(
+                self.base_dataset._labels_full[indices],
+                dtype=np.float32,
+            )
+            csv_labels = self.metadata["Y"].to_numpy(dtype=np.float32)
+            if not np.allclose(feature_labels, csv_labels):
+                raise ValueError(
+                    "Feature labels and metadata CSV labels are not aligned"
+                )
 
-    if random_layer is None:
-        return features, probabilities
-
-    if isinstance(random_layer, RandomLayer):
-        return random_layer([features, probabilities]), probabilities
-    elif isinstance(random_layer, nn.Linear):
-        combined = torch.cat([features, probabilities], dim=1)
-        return random_layer(combined), probabilities
-    else:
-        raise TypeError(f"Unsupported random_layer type: {type(random_layer)}")
-
-
-def apply_random_layer(random_layer, features, outputs):
-    domain_features, _ = condition_domain_features(features, outputs, random_layer)
-    return domain_features
-
-
-def cdan_domain_loss(discriminator, features, outputs, domain_labels, alpha=1.0, random_layer=None, use_entropy=True):
-    domain_features, probabilities = condition_domain_features(features, outputs, random_layer)
-    domain_features = ReverseLayerF.apply(domain_features, alpha)
-    domain_logits = discriminator(domain_features)
-    domain_labels = domain_labels.long().view(-1)
-
-    losses = F.cross_entropy(domain_logits, domain_labels, reduction="none")
-    if use_entropy:
-        entropy = -torch.sum(probabilities.detach() * torch.log(probabilities.detach() + 1e-8), dim=1)
-        weights = 1.0 + torch.exp(-entropy)
-        losses = losses * (weights / weights.mean().clamp_min(1e-8))
-
-    return losses.mean()
-
-
-parser = argparse.ArgumentParser(description="MAGC-DTI with clustering and domain adaptation")
-parser.add_argument(
-    '--mode',
-    default='default',
-    choices=['default', 'cross_domain'],
-    help='Experiment mode: default or cross_domain'
-)
-parser.add_argument(
-    '--lambda_cluster',
-    type=float,
-    default=0.1,
-    help='Weight of the clustering loss (default: 0.1)'
-)
-parser.add_argument(
-    '--lambda_domain',
-    type=float,
-    default=0.1,
-    help='Weight of the domain adaptation loss (default: 0.1)'
-)
-parser.add_argument(
-    '--use_cluster_loss',
-    action='store_true',
-    help='Whether to use the cluster consistency loss'
-)
-parser.add_argument(
-    '--analyze_clusters',
-    action='store_true',
-    help='Whether to analyze performance across different clusters'
-)
-parser.add_argument(
-    '--feature_dir',
-    type=str,
-    default='../code/features/varlen',
-    help='Root directory for pre-extracted features'
-)
-parser.add_argument(
-    '--feature_strategy',
-    type=str,
-    default=None,
-    help='Optional pooling strategy suffix for flat feature files, e.g. mean_mean'
-)
-parser.add_argument(
-    '--source_feature_dir',
-    type=str,
-    default=None,
-    help='Feature root for source-domain training data; defaults to --feature_dir'
-)
-parser.add_argument(
-    '--target_train_feature_dir',
-    type=str,
-    default=None,
-    help='Feature root for target-domain adaptation/validation data; defaults to --feature_dir'
-)
-parser.add_argument(
-    '--target_test_feature_dir',
-    type=str,
-    default=None,
-    help='Feature root for target-domain test data; defaults to --feature_dir'
-)
-parser.add_argument(
-    '--train_split',
-    type=str,
-    default='train',
-    help='Split name for default-mode training features'
-)
-parser.add_argument(
-    '--val_split',
-    type=str,
-    default='val',
-    help='Split name for default-mode validation features'
-)
-parser.add_argument(
-    '--test_split',
-    type=str,
-    default='test',
-    help='Split name for default-mode test features'
-)
-parser.add_argument(
-    '--source_split',
-    type=str,
-    default='source_train',
-    help='Split name for source-domain features in cross_domain mode'
-)
-parser.add_argument(
-    '--target_train_split',
-    type=str,
-    default='target_train',
-    help='Split name for target-domain training features in cross_domain mode'
-)
-parser.add_argument(
-    '--target_test_split',
-    type=str,
-    default='target_test',
-    help='Split name for target-domain test features in cross_domain mode'
-)
-parser.add_argument(
-    '--train_cluster_csv',
-    type=str,
-    default=None,
-    help='Optional CSV with drug_cluster/target_cluster columns for default train split'
-)
-parser.add_argument(
-    '--val_cluster_csv',
-    type=str,
-    default=None,
-    help='Optional CSV with drug_cluster/target_cluster columns for default validation split'
-)
-parser.add_argument(
-    '--test_cluster_csv',
-    type=str,
-    default=None,
-    help='Optional CSV with drug_cluster/target_cluster columns for default test split'
-)
-parser.add_argument(
-    '--source_cluster_csv',
-    type=str,
-    default=None,
-    help='Optional CSV with cluster columns for source-domain features'
-)
-parser.add_argument(
-    '--target_train_cluster_csv',
-    type=str,
-    default=None,
-    help='Optional CSV with cluster columns for target-domain train features'
-)
-parser.add_argument(
-    '--target_test_cluster_csv',
-    type=str,
-    default=None,
-    help='Optional CSV with cluster columns for target-domain test features'
-)
-
-warnings.filterwarnings('ignore')
-
-
-class ClusterDTIDataset(Dataset):
-    def __init__(self, csv_file, max_protein_len=1200):
-        self.data = pd.read_csv(csv_file)
-        self.max_protein_len = max_protein_len
+        self.drug_dim = getattr(self.base_dataset, "drug_dim", None)
+        self.protein_dim = getattr(self.base_dataset, "protein_dim", None)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.base_dataset)
 
-    def _smiles_to_graph(self, smiles):
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return None
+    def cluster_sets(self):
+        if not self.has_clusters:
+            return set(), set()
+        return (
+            set(self.metadata["drug_cluster"].tolist()),
+            set(self.metadata["target_cluster"].tolist()),
+        )
 
-        # Add hydrogen atoms
-        mol = Chem.AddHs(mol)
-
-        # Build richer atom features (75 dimensions)
-        atom_feats = []
-        for atom in mol.GetAtoms():
-            # Atom type one-hot encoding
-            atom_type = atom.GetAtomicNum()
-            type_features = [0] * 43  # Support the first 43 elements
-            if 0 < atom_type <= 43:
-                type_features[atom_type - 1] = 1
-
-            feat = []
-            feat.extend(type_features)
-            feat.append(int(atom.GetIsAromatic()))  # Aromaticity
-
-            # Hybridization type
-            hybridization_types = [
-                Chem.rdchem.HybridizationType.SP,
-                Chem.rdchem.HybridizationType.SP2,
-                Chem.rdchem.HybridizationType.SP3,
-                Chem.rdchem.HybridizationType.SP3D,
-                Chem.rdchem.HybridizationType.SP3D2
-            ]
-            hybridization = [0] * len(hybridization_types)
-            hybridization_type = atom.GetHybridization()
-            if hybridization_type in hybridization_types:
-                hybridization[hybridization_types.index(hybridization_type)] = 1
-            feat.extend(hybridization)
-
-            # Additional atomic features
-            feat.append(atom.GetFormalCharge())      # Formal charge
-            feat.append(len(atom.GetNeighbors()))    # Degree
-            feat.append(atom.GetTotalNumHs())        # Total number of H atoms
-            feat.append(atom.GetExplicitValence())   # Explicit valence
-            feat.append(atom.GetImplicitValence())   # Implicit valence
-            feat.append(int(atom.IsInRing()))        # Ring membership
-            feat.append(1.5)                         # Default atomic radius
-            feat.append(2.0)                         # Default electronegativity
-            feat.append(atom.GetMass())              # Atomic mass
-
-            # Pad to 75 dimensions
-            while len(feat) < 75:
-                feat.append(0)
-
-            atom_feats.append(feat)
-
-        # Create graph
-        g = dgl.graph([])
-        g.add_nodes(len(atom_feats))
-
-        # Add edges
-        src_list = []
-        dst_list = []
-        for bond in mol.GetBonds():
-            src = bond.GetBeginAtomIdx()
-            dst = bond.GetEndAtomIdx()
-            src_list.extend([src, dst])
-            dst_list.extend([dst, src])
-
-        # Ensure that the graph has at least one edge
-        if len(src_list) == 0 and len(atom_feats) > 0:
-            for i in range(len(atom_feats)):
-                src_list.append(i)
-                dst_list.append(i)
-
-        g.add_edges(src_list, dst_list)
-
-        # Add node features
-        g.ndata['h'] = torch.FloatTensor(atom_feats)
-
-        return g
-
-    def _protein_to_idx(self, protein_seq):
-        amino_acids = "ACDEFGHIKLMNPQRSTVWY"
-        aa_dict = {aa: idx + 1 for idx, aa in enumerate(amino_acids)}
-        aa_dict['X'] = 0  # Unknown amino acid
-
-        idx_list = [aa_dict.get(aa, 0) for aa in protein_seq]
-
-        if len(idx_list) > self.max_protein_len:
-            idx_list = idx_list[:self.max_protein_len]
+    def __getitem__(self, index):
+        first, second, label = self.base_dataset[index]
+        row = self.metadata.iloc[index]
+        if self.has_clusters:
+            drug_cluster = int(row["drug_cluster"])
+            target_cluster = int(row["target_cluster"])
         else:
-            idx_list = idx_list + [0] * (self.max_protein_len - len(idx_list))
+            drug_cluster = -1
+            target_cluster = -1
 
-        return torch.LongTensor(idx_list)
-
-    def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        smiles = row['SMILES']
-        protein = row['Protein']
-        label = float(row['Y'])
-
-        # Use existing cluster annotations if available;
-        # otherwise generate pseudo cluster IDs
-        if 'drug_cluster' in self.data.columns and 'target_cluster' in self.data.columns:
-            drug_cluster = int(row['drug_cluster'])
-            target_cluster = int(row['target_cluster'])
-        else:
-            drug_cluster = hash(smiles) % 10
-            target_cluster = hash(protein) % 10
-
-        graph = self._smiles_to_graph(smiles)
-        if graph is None:
-            # If the SMILES string is invalid, return a fallback graph
-            graph = dgl.graph([])
-            graph.add_nodes(1)
-            graph.ndata['h'] = torch.zeros((1, 75))
-
-        protein_tensor = self._protein_to_idx(protein)
-
-        return {
-            'graph': graph,
-            'protein': protein_tensor,
-            'label': torch.FloatTensor([label]),
-            'drug_cluster': torch.LongTensor([drug_cluster]),
-            'target_cluster': torch.LongTensor([target_cluster])
+        sample = {
+            "label": float(label),
+            "drug_cluster": drug_cluster,
+            "target_cluster": target_cluster,
         }
+        if hasattr(first, "ndata"):
+            sample["graph"] = first
+            sample["protein"] = second
+        else:
+            sample["drug_feat"] = first
+            sample["protein_feat"] = second
+        return sample
 
 
-def _first_existing_path(candidates, patterns, description):
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-
-    matches = []
-    for pattern in patterns:
-        matches.extend(glob.glob(pattern))
-    matches = sorted(set(matches))
-    if matches:
-        return matches[0]
-
-    searched = candidates + patterns
-    raise FileNotFoundError(
-        f"Cannot find {description}. Checked:\n  " + "\n  ".join(searched)
+def build_dataset(
+    csv_path,
+    require_clusters,
+    use_pretrained_features=False,
+    feature_dir=None,
+    split=None,
+    max_drug_nodes=300,
+):
+    metadata = read_metadata(csv_path, require_clusters=require_clusters)
+    if use_pretrained_features:
+        if not feature_dir or not split:
+            raise ValueError(
+                "feature_dir and split are required in pretrained mode"
+            )
+        base_dataset = PreExtractedNpyDTIDataset(
+            feature_dir=feature_dir,
+            split=split,
+            use_esm2=True,
+            use_chembert=True,
+        )
+    else:
+        base_dataset = DTIDataset(
+            np.arange(len(metadata)),
+            metadata,
+            max_drug_nodes=max_drug_nodes,
+        )
+    return AnnotatedDTIDataset(
+        base_dataset,
+        metadata,
+        require_clusters=require_clusters,
     )
 
 
-def _resolve_feature_path(feature_dir, split, kind, strategy=None):
-    split_dir = os.path.join(feature_dir, split)
-    roots = [split_dir, feature_dir]
+def collate_batch(batch):
+    labels = torch.tensor(
+        [item["label"] for item in batch],
+        dtype=torch.float32,
+    )
+    drug_clusters = torch.tensor(
+        [item["drug_cluster"] for item in batch],
+        dtype=torch.long,
+    )
+    target_clusters = torch.tensor(
+        [item["target_cluster"] for item in batch],
+        dtype=torch.long,
+    )
+    result = {
+        "label": labels,
+        "drug_cluster": drug_clusters,
+        "target_cluster": target_clusters,
+    }
 
-    if kind == "drug":
-        names = [
-            f"{split}_smiles_features.npy",
-            f"{split}_drug_features.npy",
-            f"{split}_smiles.npy",
-        ]
-        if strategy:
-            names.insert(0, f"{split}_smiles_{strategy}.npy")
-        patterns = [os.path.join(root, f"{split}_smiles*.npy") for root in roots]
-        patterns += [os.path.join(root, f"{split}_drug*.npy") for root in roots]
-        description = f"drug features for split '{split}'"
-    elif kind == "protein":
-        names = [
-            f"{split}_protein_features_esm2.npy",
-            f"{split}_protein_features.npy",
-            f"{split}_protein_esm2.npy",
-            f"{split}_protein.npy",
-        ]
-        if strategy:
-            names.insert(0, f"{split}_protein_{strategy}.npy")
-        patterns = [os.path.join(root, f"{split}_protein*esm2*.npy") for root in roots]
-        patterns += [os.path.join(root, f"{split}_protein*.npy") for root in roots]
-        description = f"protein features for split '{split}'"
-    elif kind == "label":
-        names = [f"{split}_labels.npy", f"{split}_label.npy", f"{split}_Y.npy"]
-        if strategy:
-            names.insert(0, f"{split}_labels_{strategy}.npy")
-        patterns = [os.path.join(root, f"{split}_labels*.npy") for root in roots]
-        patterns += [os.path.join(root, f"{split}_label*.npy") for root in roots]
-        description = f"labels for split '{split}'"
-    else:
-        raise ValueError(f"Unsupported feature kind: {kind}")
-
-    candidates = [os.path.join(root, name) for root in roots for name in names]
-    return _first_existing_path(candidates, patterns, description)
-
-
-class PreExtractedClusterDTIDataset(Dataset):
-    """Dataset backed by pre-extracted ChemBERTa/ESM2 features."""
-
-    def __init__(self, feature_dir, split, cluster_csv=None, feature_strategy=None):
-        self.feature_dir = os.path.abspath(feature_dir)
-        self.split = split
-        self.feature_strategy = feature_strategy
-
-        drug_path = _resolve_feature_path(self.feature_dir, split, "drug", feature_strategy)
-        protein_path = _resolve_feature_path(self.feature_dir, split, "protein", feature_strategy)
-        labels_path = _resolve_feature_path(self.feature_dir, split, "label", feature_strategy)
-
-        self.drug_features = np.load(drug_path, allow_pickle=True)
-        self.protein_features = np.load(protein_path, allow_pickle=True)
-        self.labels = np.load(labels_path, allow_pickle=True).astype(np.float32)
-
-        n = len(self.labels)
-        if len(self.drug_features) != n:
-            raise ValueError(f"Drug feature rows ({len(self.drug_features)}) != labels ({n})")
-        if len(self.protein_features) != n:
-            raise ValueError(f"Protein feature rows ({len(self.protein_features)}) != labels ({n})")
-
-        self.cluster_data = None
-        if cluster_csv and os.path.isfile(cluster_csv):
-            self.cluster_data = pd.read_csv(cluster_csv)
-            if len(self.cluster_data) != n:
-                raise ValueError(
-                    f"Cluster CSV rows ({len(self.cluster_data)}) != labels ({n}): {cluster_csv}"
-                )
-
-        self.drug_dim = self._feature_dim(self.drug_features[0])
-        self.protein_dim = self._feature_dim(self.protein_features[0])
-
-        print(
-            f"Loaded {split}: samples={n}, drug_dim={self.drug_dim}, "
-            f"protein_dim={self.protein_dim}"
+    if "graph" in batch[0]:
+        result["graph"] = dgl.batch([item["graph"] for item in batch])
+        result["protein"] = torch.as_tensor(
+            np.asarray([item["protein"] for item in batch]),
+            dtype=torch.long,
         )
-        print(f"  drug features: {drug_path}")
-        print(f"  protein features: {protein_path}")
-        print(f"  labels: {labels_path}")
-        if cluster_csv:
-            print(f"  clusters: {cluster_csv if self.cluster_data is not None else 'not found; using pseudo clusters'}")
+        return result
 
-    @staticmethod
-    def _feature_vector(feature):
-        arr = np.asarray(feature, dtype=np.float32)
-        if arr.ndim == 0:
-            raise ValueError("Feature item must be at least 1-D")
-        if arr.ndim > 1:
-            arr = arr.mean(axis=0)
-        return np.ascontiguousarray(arr.reshape(-1), dtype=np.float32)
-
-    @classmethod
-    def _feature_dim(cls, feature):
-        return int(cls._feature_vector(feature).shape[0])
-
-    def __len__(self):
-        return len(self.labels)
-
-    def _clusters_for_row(self, idx):
-        if self.cluster_data is not None:
-            row = self.cluster_data.iloc[idx]
-            if 'drug_cluster' in self.cluster_data.columns and 'target_cluster' in self.cluster_data.columns:
-                return int(row['drug_cluster']), int(row['target_cluster'])
-
-        return idx % 10, (idx * 9973) % 10
-
-    def __getitem__(self, idx):
-        drug_feat = torch.from_numpy(self._feature_vector(self.drug_features[idx]))
-        protein_feat = torch.from_numpy(self._feature_vector(self.protein_features[idx]))
-        label = torch.FloatTensor([float(self.labels[idx])])
-        drug_cluster, target_cluster = self._clusters_for_row(idx)
-
-        return {
-            'drug_feat': drug_feat,
-            'protein_feat': protein_feat,
-            'label': label,
-            'drug_cluster': torch.LongTensor([drug_cluster]),
-            'target_cluster': torch.LongTensor([target_cluster])
-        }
+    drug_features = [item["drug_feat"] for item in batch]
+    protein_features = [item["protein_feat"] for item in batch]
+    result["drug_feat"] = (
+        torch.stack(drug_features)
+        if drug_features[0].dim() == 1
+        else pad_sequence(
+            drug_features,
+            batch_first=True,
+            padding_value=0.0,
+        )
+    )
+    result["protein_feat"] = (
+        torch.stack(protein_features)
+        if protein_features[0].dim() == 1
+        else pad_sequence(
+            protein_features,
+            batch_first=True,
+            padding_value=0.0,
+        )
+    )
+    return result
 
 
-def collate_fn(batch):
-    graphs = [item['graph'] for item in batch]
-    proteins = torch.stack([item['protein'] for item in batch])
-    labels = torch.cat([item['label'] for item in batch])
-    drug_clusters = torch.cat([item['drug_cluster'] for item in batch])
-    target_clusters = torch.cat([item['target_cluster'] for item in batch])
-
-    batched_graph = dgl.batch(graphs)
-
-    return {
-        'graph': batched_graph,
-        'protein': proteins,
-        'label': labels,
-        'drug_cluster': drug_clusters,
-        'target_cluster': target_clusters
-    }
-
-
-def pretrained_collate_fn(batch):
-    drug_feats = torch.stack([item['drug_feat'] for item in batch])
-    protein_feats = torch.stack([item['protein_feat'] for item in batch])
-    labels = torch.cat([item['label'] for item in batch])
-    drug_clusters = torch.cat([item['drug_cluster'] for item in batch])
-    target_clusters = torch.cat([item['target_cluster'] for item in batch])
-
-    return {
-        'drug_feat': drug_feats,
-        'protein_feat': protein_feats,
-        'label': labels,
-        'drug_cluster': drug_clusters,
-        'target_cluster': target_clusters
-    }
+def make_loader(dataset, batch_size, shuffle, num_workers):
+    if shuffle and len(dataset) < 2:
+        raise ValueError("A training dataset must contain at least 2 samples")
+    drop_last = (
+        shuffle
+        and len(dataset) > batch_size
+        and len(dataset) % batch_size == 1
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=collate_batch,
+        drop_last=drop_last,
+        pin_memory=torch.cuda.is_available(),
+    )
 
 
-def forward_feature_batch(model, batch, device):
-    drug_feats = batch['drug_feat'].to(device)
-    protein_feats = batch['protein_feat'].to(device)
-    _, _, features, outputs = model(drug_feats, protein_feats, mode="train")
-    return features, outputs
+def validate_cross_domain_split(source, target_train, validation, target_test,
+                                validation_domain):
+    source_drugs, source_targets = source.cluster_sets()
+    target_drugs, target_targets = target_train.cluster_sets()
+    test_drugs, test_targets = target_test.cluster_sets()
+    val_drugs, val_targets = validation.cluster_sets()
 
+    target_drugs |= test_drugs
+    target_targets |= test_targets
+    if validation_domain == "source":
+        source_drugs |= val_drugs
+        source_targets |= val_targets
+    else:
+        target_drugs |= val_drugs
+        target_targets |= val_targets
 
-class ClusterAwareLoss(nn.Module):
-    def __init__(self, lambda_cluster=0.0, lambda_domain=0.0, use_cluster_loss=False):
-        super().__init__()
-        self.lambda_cluster = lambda_cluster
-        self.lambda_domain = lambda_domain
-        self.use_cluster_loss = use_cluster_loss
-        self.bce = nn.BCEWithLogitsLoss()
-        self.domain_criterion = nn.CrossEntropyLoss()
-
-    def forward(self, pred, target, drug_cluster=None, target_cluster=None, domain_pred=None, domain_label=None):
-        if pred.dim() == 2 and target.dim() == 1:
-            target = target.unsqueeze(1)
-
-        task_loss = self.bce(pred, target)
-
-        cluster_loss = 0
-        if self.use_cluster_loss and drug_cluster is not None and target_cluster is not None:
-            unique_drug_clusters = torch.unique(drug_cluster)
-            unique_target_clusters = torch.unique(target_cluster)
-
-            for dc in unique_drug_clusters:
-                dc_mask = (drug_cluster == dc)
-                if dc_mask.sum() > 1:
-                    dc_preds = pred[dc_mask]
-                    dc_mean = dc_preds.mean()
-                    cluster_loss += ((dc_preds - dc_mean) ** 2).mean()
-
-            for tc in unique_target_clusters:
-                tc_mask = (target_cluster == tc)
-                if tc_mask.sum() > 1:
-                    tc_preds = pred[tc_mask]
-                    tc_mean = tc_preds.mean()
-                    cluster_loss += ((tc_preds - tc_mean) ** 2).mean()
-
-        domain_loss = 0
-        if domain_pred is not None and domain_label is not None:
-            domain_label = domain_label.long().view(-1)
-            domain_loss = self.domain_criterion(domain_pred, domain_label)
-
-        return task_loss + self.lambda_cluster * cluster_loss + self.lambda_domain * domain_loss
-
-
-def train_epoch(model, dataloader, optimizer, criterion, device, discriminator=None, optimizer_d=None, epoch=0,
-                da_init_epoch=0, random_layer=None, use_entropy=True):
-    model.train()
-    if discriminator is not None:
-        discriminator.train()
-
-    total_loss = 0
-    total_domain_loss = 0
-    all_preds = []
-    all_labels = []
-
-    for batch in dataloader:
-        optimizer.zero_grad()
-        if optimizer_d is not None:
-            optimizer_d.zero_grad()
-
-        features, outputs = forward_feature_batch(model, batch, device)
-        labels = batch['label'].to(device)
-        drug_clusters = batch['drug_cluster'].to(device)
-        target_clusters = batch['target_cluster'].to(device)
-
-        if discriminator is not None and epoch >= da_init_epoch:
-            p = float(epoch - da_init_epoch) / (100 - da_init_epoch)
-            alpha = 2. / (1. + np.exp(-10 * p)) - 1
-
-            domain_label = torch.zeros(features.size(0), dtype=torch.long, device=device)
-            if 'is_target' in batch:
-                domain_label[batch['is_target'].to(device).bool()] = 1
-
-            task_loss = criterion(outputs, labels, drug_clusters, target_clusters)
-            domain_loss = cdan_domain_loss(
-                discriminator,
-                features,
-                outputs,
-                domain_label,
-                alpha=alpha,
-                random_layer=random_layer,
-                use_entropy=use_entropy
+    for name, source_ids, target_ids in (
+        ("drug", source_drugs, target_drugs),
+        ("target", source_targets, target_targets),
+    ):
+        overlap = source_ids.intersection(target_ids)
+        if overlap:
+            preview = sorted(overlap, key=str)[:10]
+            raise ValueError(
+                f"{name} clusters overlap between source and target "
+                f"domains: {preview}"
             )
-            loss = task_loss + criterion.lambda_domain * domain_loss
-            total_domain_loss += domain_loss.item()
-        else:
-            loss = criterion(outputs, labels, drug_clusters, target_clusters)
+        total = len(source_ids) + len(target_ids)
+        if total == 0:
+            raise ValueError(f"No {name} cluster IDs were found")
+        source_ratio = len(source_ids) / total
+        print(
+            f"{name.capitalize()} clusters: source={len(source_ids)}, "
+            f"target={len(target_ids)}, source_ratio={source_ratio:.3f}"
+        )
+        if not 0.50 <= source_ratio <= 0.70:
+            raise ValueError(
+                f"{name} source-cluster ratio {source_ratio:.3f} is not "
+                "consistent with the paper's 60/40 split"
+            )
 
+
+def prediction_probabilities(logits):
+    positive = torch.sigmoid(logits.reshape(-1))
+    return torch.stack((1.0 - positive, positive), dim=1)
+
+
+def multilinear_condition(features, logits):
+    """Return flatten(f_joint outer_product g), exactly as paper Eq. (9)."""
+    features = features.flatten(start_dim=1)
+    probabilities = prediction_probabilities(logits)
+    conditioned = torch.bmm(
+        features.unsqueeze(2),
+        probabilities.unsqueeze(1),
+    ).flatten(start_dim=1)
+    return conditioned, probabilities
+
+
+def cdan_domain_loss(discriminator, features, logits, domain_labels, alpha):
+    conditioned, _ = multilinear_condition(features, logits)
+    reversed_features = ReverseLayerF.apply(conditioned, alpha)
+    domain_logits = discriminator(reversed_features)
+    return F.cross_entropy(
+        domain_logits,
+        domain_labels.long().reshape(-1),
+    )
+
+
+def forward_batch(model, batch, device):
+    if "graph" in batch:
+        drug_input = batch["graph"].to(device)
+        protein_input = batch["protein"].to(device)
+    else:
+        drug_input = batch["drug_feat"].to(device)
+        protein_input = batch["protein_feat"].to(device)
+    _, _, joint_features, logits = model(
+        drug_input,
+        protein_input,
+        mode="train",
+    )
+    return joint_features, logits.reshape(-1)
+
+
+def safe_auroc(labels, probabilities):
+    if np.unique(labels).size < 2:
+        return float("nan")
+    return float(roc_auc_score(labels, probabilities))
+
+
+def compute_metrics(labels, probabilities, loss):
+    labels = np.asarray(labels, dtype=np.float32)
+    probabilities = np.asarray(probabilities, dtype=np.float32)
+    predictions = (probabilities >= 0.5).astype(np.int64)
+    return {
+        "loss": float(loss),
+        "auroc": safe_auroc(labels, probabilities),
+        "auprc": float(average_precision_score(labels, probabilities)),
+        "accuracy": float(accuracy_score(labels, predictions)),
+        "precision": float(
+            precision_score(labels, predictions, zero_division=0)
+        ),
+        "recall": float(
+            recall_score(labels, predictions, zero_division=0)
+        ),
+    }
+
+
+def grl_alpha(epoch, init_epoch, max_epochs):
+    if epoch < init_epoch:
+        return 0.0
+    denominator = max(1, max_epochs - init_epoch - 1)
+    progress = min(1.0, (epoch - init_epoch) / denominator)
+    return float(2.0 / (1.0 + np.exp(-10.0 * progress)) - 1.0)
+
+
+def train_epoch(model, loader, optimizer, task_criterion, device):
+    model.train()
+    total_loss = 0.0
+    labels_all = []
+    probabilities_all = []
+
+    for batch in loader:
+        optimizer.zero_grad(set_to_none=True)
+        labels = batch["label"].to(device)
+        _, logits = forward_batch(model, batch, device)
+        loss = task_criterion(logits, labels)
         loss.backward()
         optimizer.step()
-        if optimizer_d is not None:
-            optimizer_d.step()
 
         total_loss += loss.item()
+        labels_all.extend(labels.detach().cpu().numpy())
+        probabilities_all.extend(
+            torch.sigmoid(logits).detach().cpu().numpy()
+        )
 
-        pred_numpy = torch.sigmoid(outputs).detach().cpu().numpy()
-        if pred_numpy.ndim == 2:
-            pred_numpy = pred_numpy.squeeze(1)
-        all_preds.extend(pred_numpy)
-
-        label_numpy = labels.cpu().numpy()
-        if label_numpy.ndim == 2:
-            label_numpy = label_numpy.squeeze(1)
-        all_labels.extend(label_numpy)
-
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-
-    auc = roc_auc_score(all_labels, all_preds)
-    acc = accuracy_score(all_labels, (all_preds > 0.5).astype(int))
-
-    metrics = {
-        'loss': total_loss / len(dataloader),
-        'domain_loss': total_domain_loss / len(dataloader) if discriminator is not None else 0,
-        'auc': auc,
-        'acc': acc
-    }
-
-    return metrics
+    return compute_metrics(
+        labels_all,
+        probabilities_all,
+        total_loss / len(loader),
+    )
 
 
-def train_da_epoch(model, source_loader, target_loader, optimizer, criterion, device, discriminator, optimizer_d,
-                   epoch, da_init_epoch, lambda_domain=0.1, random_layer=None, use_entropy=True):
-    """Train one epoch under cross-domain adaptation."""
+def train_domain_epoch(
+    model,
+    discriminator,
+    source_loader,
+    target_loader,
+    optimizer,
+    discriminator_optimizer,
+    task_criterion,
+    device,
+    epoch,
+    init_epoch,
+    max_epochs,
+    lambda_domain,
+):
     model.train()
     discriminator.train()
-
-    total_loss = 0
-    total_domain_loss = 0
-    all_source_preds = []
-    all_source_labels = []
-
+    total_loss = 0.0
+    total_domain_loss = 0.0
+    labels_all = []
+    probabilities_all = []
+    source_iterator = iter(source_loader)
+    target_iterator = iter(target_loader)
     n_batches = max(len(source_loader), len(target_loader))
-    source_iter = iter(source_loader)
-    target_iter = iter(target_loader)
+    alpha = grl_alpha(epoch, init_epoch, max_epochs)
 
     for _ in range(n_batches):
         try:
-            source_batch = next(source_iter)
+            source_batch = next(source_iterator)
         except StopIteration:
-            source_iter = iter(source_loader)
-            source_batch = next(source_iter)
-
+            source_iterator = iter(source_loader)
+            source_batch = next(source_iterator)
         try:
-            target_batch = next(target_iter)
+            target_batch = next(target_iterator)
         except StopIteration:
-            target_iter = iter(target_loader)
-            target_batch = next(target_iter)
+            target_iterator = iter(target_loader)
+            target_batch = next(target_iterator)
 
-        optimizer.zero_grad()
-        optimizer_d.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
+        discriminator_optimizer.zero_grad(set_to_none=True)
+        source_labels = source_batch["label"].to(device)
 
-        source_labels = source_batch['label'].to(device)
-        source_drug_clusters = source_batch['drug_cluster'].to(device)
-        source_target_clusters = source_batch['target_cluster'].to(device)
+        source_features, source_logits = forward_batch(
+            model,
+            source_batch,
+            device,
+        )
+        task_loss = task_criterion(source_logits, source_labels)
 
-        features_source, outputs_source = forward_feature_batch(model, source_batch, device)
-
-        features_target, outputs_target = forward_feature_batch(model, target_batch, device)
-
-        p = float(epoch - da_init_epoch) / (100 - da_init_epoch)
-        alpha = 2. / (1. + np.exp(-10 * p)) - 1
-
-        task_loss = criterion(outputs_source, source_labels, source_drug_clusters, source_target_clusters)
-
-        if epoch >= da_init_epoch:
-            domain_features = torch.cat([features_source, features_target], dim=0)
-            domain_outputs = torch.cat([outputs_source, outputs_target], dim=0)
+        if epoch >= init_epoch:
+            target_features, target_logits = forward_batch(
+                model,
+                target_batch,
+                device,
+            )
+            features = torch.cat(
+                (source_features, target_features),
+                dim=0,
+            )
+            logits = torch.cat(
+                (source_logits, target_logits),
+                dim=0,
+            )
             domain_labels = torch.cat(
-                [
-                    torch.zeros(features_source.size(0), dtype=torch.long, device=device),
-                    torch.ones(features_target.size(0), dtype=torch.long, device=device)
-                ],
-                dim=0
+                (
+                    torch.zeros(
+                        source_features.size(0),
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                    torch.ones(
+                        target_features.size(0),
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                )
             )
             domain_loss = cdan_domain_loss(
                 discriminator,
-                domain_features,
-                domain_outputs,
+                features,
+                logits,
                 domain_labels,
                 alpha=alpha,
-                random_layer=random_layer,
-                use_entropy=use_entropy
             )
-
             loss = task_loss + lambda_domain * domain_loss
             total_domain_loss += domain_loss.item()
         else:
@@ -729,460 +573,423 @@ def train_da_epoch(model, source_loader, target_loader, optimizer, criterion, de
 
         loss.backward()
         optimizer.step()
-        if epoch >= da_init_epoch:
-            optimizer_d.step()
+        if epoch >= init_epoch:
+            discriminator_optimizer.step()
 
         total_loss += loss.item()
+        labels_all.extend(source_labels.detach().cpu().numpy())
+        probabilities_all.extend(
+            torch.sigmoid(source_logits).detach().cpu().numpy()
+        )
 
-        pred_numpy = torch.sigmoid(outputs_source).detach().cpu().numpy()
-        if pred_numpy.ndim == 2:
-            pred_numpy = pred_numpy.squeeze(1)
-        all_source_preds.extend(pred_numpy)
-
-        label_numpy = source_labels.cpu().numpy()
-        if label_numpy.ndim == 2:
-            label_numpy = label_numpy.squeeze(1)
-        all_source_labels.extend(label_numpy)
-
-    all_source_preds = np.array(all_source_preds)
-    all_source_labels = np.array(all_source_labels)
-
-    auc = roc_auc_score(all_source_labels, all_source_preds)
-    acc = accuracy_score(all_source_labels, (all_source_preds > 0.5).astype(int))
-
-    metrics = {
-        'loss': total_loss / n_batches,
-        'domain_loss': total_domain_loss / n_batches if epoch >= da_init_epoch else 0,
-        'auc': auc,
-        'acc': acc
-    }
-
+    metrics = compute_metrics(
+        labels_all,
+        probabilities_all,
+        total_loss / n_batches,
+    )
+    metrics["domain_loss"] = (
+        total_domain_loss / n_batches if epoch >= init_epoch else 0.0
+    )
+    metrics["grl_alpha"] = alpha
     return metrics
 
 
-def evaluate(model, dataloader, criterion, device):
+@torch.no_grad()
+def evaluate(model, loader, task_criterion, device):
     model.eval()
-    total_loss = 0
-    all_preds = []
-    all_labels = []
+    total_loss = 0.0
+    labels_all = []
+    probabilities_all = []
 
-    with torch.no_grad():
-        for batch in dataloader:
-            labels = batch['label'].to(device)
-            drug_clusters = batch['drug_cluster'].to(device)
-            target_clusters = batch['target_cluster'].to(device)
+    for batch in loader:
+        labels = batch["label"].to(device)
+        _, logits = forward_batch(model, batch, device)
+        loss = task_criterion(logits, labels)
+        total_loss += loss.item()
+        labels_all.extend(labels.cpu().numpy())
+        probabilities_all.extend(torch.sigmoid(logits).cpu().numpy())
 
-            _, outputs = forward_feature_batch(model, batch, device)
-
-            if outputs.dim() == 2 and outputs.size(1) == 1:
-                outputs = outputs.squeeze(1)
-
-            loss = criterion(outputs, labels.squeeze(), drug_clusters, target_clusters)
-            total_loss += loss.item()
-
-            pred_numpy = torch.sigmoid(outputs).cpu().numpy()
-            if pred_numpy.ndim == 2:
-                pred_numpy = pred_numpy.squeeze(1)
-            all_preds.extend(pred_numpy)
-
-            label_numpy = labels.cpu().numpy()
-            if label_numpy.ndim == 2:
-                label_numpy = label_numpy.squeeze(1)
-            all_labels.extend(label_numpy)
-
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-
-    metrics = {
-        'loss': total_loss / len(dataloader),
-        'auc': roc_auc_score(all_labels, all_preds),
-        'auprc': average_precision_score(all_labels, all_preds),
-        'acc': accuracy_score(all_labels, (all_preds > 0.5).astype(int)),
-        'precision': precision_score(all_labels, (all_preds > 0.5).astype(int), zero_division=0),
-        'recall': recall_score(all_labels, (all_preds > 0.5).astype(int), zero_division=0)
-    }
-    return metrics
+    return compute_metrics(
+        labels_all,
+        probabilities_all,
+        total_loss / len(loader),
+    )
 
 
-def analyze_cluster_performance(model, dataloader, device):
+@torch.no_grad()
+def analyze_cluster_performance(model, loader, device):
     model.eval()
-
-    drug_cluster_results = {}
-    target_cluster_results = {}
-
-    with torch.no_grad():
-        for batch in dataloader:
-            labels = np.atleast_1d(batch['label'].cpu().numpy().squeeze())
-            drug_clusters = np.atleast_1d(batch['drug_cluster'].cpu().numpy().squeeze())
-            target_clusters = np.atleast_1d(batch['target_cluster'].cpu().numpy().squeeze())
-
-            _, outputs = forward_feature_batch(model, batch, device)
-            predictions = np.atleast_1d(torch.sigmoid(outputs).cpu().numpy().squeeze())
-
-            for i in range(len(labels)):
-                dc = int(drug_clusters[i])
-                if dc not in drug_cluster_results:
-                    drug_cluster_results[dc] = {'preds': [], 'labels': []}
-                drug_cluster_results[dc]['preds'].append(float(predictions[i]))
-                drug_cluster_results[dc]['labels'].append(float(labels[i]))
-
-            for i in range(len(labels)):
-                tc = int(target_clusters[i])
-                if tc not in target_cluster_results:
-                    target_cluster_results[tc] = {'preds': [], 'labels': []}
-                target_cluster_results[tc]['preds'].append(float(predictions[i]))
-                target_cluster_results[tc]['labels'].append(float(labels[i]))
-
-    print("\n===== Drug Cluster Performance Analysis =====")
-    drug_cluster_metrics = {}
-    for cluster_id, data in drug_cluster_results.items():
-        if len(data['labels']) < 5:
-            continue
-        try:
-            labels_array = np.array(data['labels'])
-            preds_array = np.array(data['preds'])
-            auc = roc_auc_score(labels_array, preds_array)
-            acc = accuracy_score(labels_array, (preds_array > 0.5).astype(int))
-            drug_cluster_metrics[cluster_id] = {'auc': auc, 'acc': acc, 'count': len(data['labels'])}
-            print(f"Drug cluster {cluster_id}: samples={len(data['labels'])}, AUC={auc:.4f}, ACC={acc:.4f}")
-        except Exception as e:
-            print(f"Drug cluster {cluster_id}: samples={len(data['labels'])}, failed to compute metrics: {str(e)}")
-
-    print("\n===== Target Cluster Performance Analysis =====")
-    target_cluster_metrics = {}
-    for cluster_id, data in target_cluster_results.items():
-        if len(data['labels']) < 5:
-            continue
-        try:
-            labels_array = np.array(data['labels'])
-            preds_array = np.array(data['preds'])
-            auc = roc_auc_score(labels_array, preds_array)
-            acc = accuracy_score(labels_array, (preds_array > 0.5).astype(int))
-            target_cluster_metrics[cluster_id] = {'auc': auc, 'acc': acc, 'count': len(data['labels'])}
-            print(f"Target cluster {cluster_id}: samples={len(data['labels'])}, AUC={auc:.4f}, ACC={acc:.4f}")
-        except Exception as e:
-            print(f"Target cluster {cluster_id}: samples={len(data['labels'])}, failed to compute metrics: {str(e)}")
-
-    return drug_cluster_metrics, target_cluster_metrics
-
-
-def load_data(mode="default", warn_missing=False):
-    if mode == "cross_domain":
-        # DrugBank-style cross-domain data
-        source_train_path = '../datasets/BindingDB/cluster/source_train'
-        target_train_path = '../datasets/BindingDB/cluster/target_train'
-        target_test_path = '../datasets/BindingDB/cluster/target_test'
-
-        # Check whether files exist
-        if warn_missing and not (
-            os.path.exists(source_train_path) and
-            os.path.exists(target_train_path) and
-            os.path.exists(target_test_path)
+    results = {"drug": {}, "target": {}}
+    for batch in loader:
+        labels = batch["label"].cpu().numpy()
+        _, logits = forward_batch(model, batch, device)
+        probabilities = torch.sigmoid(logits).cpu().numpy()
+        for kind, key in (
+            ("drug", "drug_cluster"),
+            ("target", "target_cluster"),
         ):
-            print("The cross-domain data files do not exist. Please ensure the following files are available:")
-            print(source_train_path)
-            print(target_train_path)
-            print(target_test_path)
-            return load_data(mode="default")
+            for cluster_id, label, probability in zip(
+                batch[key].numpy(),
+                labels,
+                probabilities,
+            ):
+                if int(cluster_id) < 0:
+                    continue
+                bucket = results[kind].setdefault(
+                    int(cluster_id),
+                    {"labels": [], "probabilities": []},
+                )
+                bucket["labels"].append(float(label))
+                bucket["probabilities"].append(float(probability))
 
-        return source_train_path, target_train_path, target_test_path
-    else:
-        # Default data
-        train_path = '../datasets/BindingDB/cluster/train_with_clusters'
-        val_path = '../datasets/BindingDB/cluster/val_with_clusters'
-        test_path = '../datasets/BindingDB/cluster/test_with_clusters'
+    summary = {"drug": {}, "target": {}}
+    for kind, clusters in results.items():
+        for cluster_id, values in clusters.items():
+            labels = np.asarray(values["labels"])
+            probabilities = np.asarray(values["probabilities"])
+            summary[kind][cluster_id] = {
+                "count": int(labels.size),
+                "auroc": safe_auroc(labels, probabilities),
+                "accuracy": float(
+                    accuracy_score(
+                        labels,
+                        (probabilities >= 0.5).astype(np.int64),
+                    )
+                ),
+            }
+    return summary
 
-        # Check whether files exist
-        if warn_missing and not (
-            os.path.exists(train_path) and
-            os.path.exists(val_path) and
-            os.path.exists(test_path)
-        ):
-            print("The default data files do not exist. Please ensure the following files are available:")
-            print(train_path)
-            print(val_path)
-            print(test_path)
 
-        return train_path, val_path, test_path
+def build_datasets(args, max_drug_nodes):
+    use_features = args.use_pretrained_features
+    if args.mode == "cross_domain":
+        source_csv = resolve_csv(
+            args.source_csv,
+            args.data_dir,
+            args.source_split,
+        )
+        target_train_csv = resolve_csv(
+            args.target_train_csv,
+            args.data_dir,
+            args.target_train_split,
+        )
+        validation_csv = resolve_csv(
+            args.validation_csv,
+            args.data_dir,
+            args.validation_split,
+        )
+        target_test_csv = resolve_csv(
+            args.target_test_csv,
+            args.data_dir,
+            args.target_test_split,
+        )
+        source = build_dataset(
+            source_csv,
+            True,
+            use_pretrained_features=use_features,
+            feature_dir=args.source_feature_dir or args.feature_dir,
+            split=args.source_split,
+            max_drug_nodes=max_drug_nodes,
+        )
+        target_train = build_dataset(
+            target_train_csv,
+            True,
+            use_pretrained_features=use_features,
+            feature_dir=args.target_train_feature_dir or args.feature_dir,
+            split=args.target_train_split,
+            max_drug_nodes=max_drug_nodes,
+        )
+        validation = build_dataset(
+            validation_csv,
+            True,
+            use_pretrained_features=use_features,
+            feature_dir=args.validation_feature_dir or args.feature_dir,
+            split=args.validation_split,
+            max_drug_nodes=max_drug_nodes,
+        )
+        target_test = build_dataset(
+            target_test_csv,
+            True,
+            use_pretrained_features=use_features,
+            feature_dir=args.target_test_feature_dir or args.feature_dir,
+            split=args.target_test_split,
+            max_drug_nodes=max_drug_nodes,
+        )
+        validate_cross_domain_split(
+            source,
+            target_train,
+            validation,
+            target_test,
+            args.validation_domain,
+        )
+        return source, validation, target_test, target_train
+
+    train = build_dataset(
+        resolve_csv(args.train_csv, args.data_dir, args.train_split),
+        False,
+        use_pretrained_features=use_features,
+        feature_dir=args.feature_dir,
+        split=args.train_split,
+        max_drug_nodes=max_drug_nodes,
+    )
+    validation = build_dataset(
+        resolve_csv(args.val_csv, args.data_dir, args.val_split),
+        False,
+        use_pretrained_features=use_features,
+        feature_dir=args.feature_dir,
+        split=args.val_split,
+        max_drug_nodes=max_drug_nodes,
+    )
+    test = build_dataset(
+        resolve_csv(args.test_csv, args.data_dir, args.test_split),
+        False,
+        use_pretrained_features=use_features,
+        feature_dir=args.feature_dir,
+        split=args.test_split,
+        max_drug_nodes=max_drug_nodes,
+    )
+    return train, validation, test, None
+
+
+def load_model_state(path, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def monitored_score(metrics, monitor):
+    if monitor == "loss":
+        return -metrics["loss"]
+    if monitor == "auprc":
+        return metrics["auprc"]
+    return metrics["auroc"]
 
 
 def main():
-    args = parser.parse_args()
+    args = parse_args()
+    if args.lambda_domain < 0:
+        raise ValueError("--lambda_domain must be non-negative")
+    if args.da_init_epoch < 0:
+        raise ValueError("--da_init_epoch must be non-negative")
 
-    config = {
-        "DRUG": {
-            "NODE_IN_FEATS": 75,
-            "NODE_IN_EMBEDDING": 128,
-            "HIDDEN_LAYERS": [128, 128, 128],
-            "PADDING": True
-        },
-        "PROTEIN": {
-            "EMBEDDING_DIM": 128,
-            "NUM_FILTERS": [128, 128, 128],
-            "NUM_HEAD": 4,
-            "PADDING": True
-        },
-        "DECODER": {
-            "IN_DIM": 384,
-            "HIDDEN_DIM": 768,
-            "OUT_DIM": 384,
-            "BINARY": 1,
-            "DROPOUT_RATE": 0.02
-        },
-        "PRETRAINED": {
-            "USE_ESM2": True,
-            "USE_CHEMBERT": True,
-            "ESM2_DIM": 1280,
-            "CHEMBERT_DIM": 384,
-            "FEATURE_DIR": args.feature_dir
-        },
-        "AGICA_CROSS_ATTENTION": {
-            "NUM_HEAD": 4,
-            "EMBEDDING_DIM": 128,
-            "AGICA_DROPOUT_RATE": 0.1
-        },
-        "DA": {
-            "USE": args.mode == "cross_domain",
-            "METHOD": "CDAN",
-            "INIT_EPOCH": 10,
-            "LAMBDA_DOMAIN": args.lambda_domain,
-            "LAMBDA_CLUSTER": args.lambda_cluster,
-            "RANDOM_LAYER": True,
-            "RANDOM_DIM": 256,
-            "ORIGINAL_RANDOM": False,
-            "USE_ENTROPY": True
-        },
-        "SOLVER": {
-            "MAX_EPOCH": 100,
-            "BATCH_SIZE": 64,
-            "LR": 1e-4
-        },
-        "RESULT": {
-            "OUTPUT_DIR": "./results",
-            "SAVE_MODEL": True
-        }
-    }
+    cfg = get_cfg_defaults()
+    max_epochs = args.max_epochs or cfg.SOLVER.MAX_EPOCH
+    batch_size = args.batch_size or cfg.SOLVER.BATCH_SIZE
+    num_workers = (
+        cfg.SOLVER.NUM_WORKERS
+        if args.num_workers is None
+        else args.num_workers
+    )
+    if args.da_init_epoch >= max_epochs and args.mode == "cross_domain":
+        raise ValueError("--da_init_epoch must be smaller than max_epochs")
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    print(f"Running in {args.mode} mode")
-
-    torch.manual_seed(42)
-    np.random.seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
-
-    if args.mode == "cross_domain":
-        default_source_csv, default_target_train_csv, default_target_test_csv = load_data(mode="cross_domain")
-
-        source_dataset = PreExtractedClusterDTIDataset(
-            args.source_feature_dir or args.feature_dir,
-            args.source_split,
-            cluster_csv=args.source_cluster_csv or default_source_csv,
-            feature_strategy=args.feature_strategy
-        )
-        target_train_dataset = PreExtractedClusterDTIDataset(
-            args.target_train_feature_dir or args.feature_dir,
-            args.target_train_split,
-            cluster_csv=args.target_train_cluster_csv or default_target_train_csv,
-            feature_strategy=args.feature_strategy
-        )
-        target_test_dataset = PreExtractedClusterDTIDataset(
-            args.target_test_feature_dir or args.feature_dir,
-            args.target_test_split,
-            cluster_csv=args.target_test_cluster_csv or default_target_test_csv,
-            feature_strategy=args.feature_strategy
-        )
-
-        print(f"Source train dataset size: {len(source_dataset)}")
-        print(f"Target train dataset size: {len(target_train_dataset)}")
-        print(f"Target test dataset size: {len(target_test_dataset)}")
-
-        train_loader = DataLoader(
-            source_dataset,
-            batch_size=config["SOLVER"]["BATCH_SIZE"],
-            shuffle=True,
-            collate_fn=pretrained_collate_fn
-        )
-        valid_loader = DataLoader(
-            target_train_dataset,
-            batch_size=config["SOLVER"]["BATCH_SIZE"],
-            shuffle=True,
-            collate_fn=pretrained_collate_fn
-        )
-        test_loader = DataLoader(
-            target_test_dataset,
-            batch_size=config["SOLVER"]["BATCH_SIZE"],
-            shuffle=False,
-            collate_fn=pretrained_collate_fn
-        )
-
-        source_loader = train_loader
-        target_train_loader = valid_loader
-    else:
-        default_train_csv, default_val_csv, default_test_csv = load_data()
-
-        train_dataset = PreExtractedClusterDTIDataset(
-            args.feature_dir,
-            args.train_split,
-            cluster_csv=args.train_cluster_csv or default_train_csv,
-            feature_strategy=args.feature_strategy
-        )
-        valid_dataset = PreExtractedClusterDTIDataset(
-            args.feature_dir,
-            args.val_split,
-            cluster_csv=args.val_cluster_csv or default_val_csv,
-            feature_strategy=args.feature_strategy
-        )
-        test_dataset = PreExtractedClusterDTIDataset(
-            args.feature_dir,
-            args.test_split,
-            cluster_csv=args.test_cluster_csv or default_test_csv,
-            feature_strategy=args.feature_strategy
-        )
-
-        print(f"Train dataset size: {len(train_dataset)}")
-        print(f"Validation dataset size: {len(valid_dataset)}")
-        print(f"Test dataset size: {len(test_dataset)}")
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config["SOLVER"]["BATCH_SIZE"],
-            shuffle=True,
-            collate_fn=pretrained_collate_fn
-        )
-        valid_loader = DataLoader(
-            valid_dataset,
-            batch_size=config["SOLVER"]["BATCH_SIZE"],
-            shuffle=False,
-            collate_fn=pretrained_collate_fn
-        )
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=config["SOLVER"]["BATCH_SIZE"],
-            shuffle=False,
-            collate_fn=pretrained_collate_fn
-        )
-
-    datasets_for_dim_check = [train_loader.dataset, valid_loader.dataset, test_loader.dataset]
-    drug_dims = {dataset.drug_dim for dataset in datasets_for_dim_check}
-    protein_dims = {dataset.protein_dim for dataset in datasets_for_dim_check}
-    if len(drug_dims) != 1 or len(protein_dims) != 1:
-        raise ValueError(f"Inconsistent feature dimensions: drug={drug_dims}, protein={protein_dims}")
-
-    config["PRETRAINED"]["CHEMBERT_DIM"] = train_loader.dataset.drug_dim
-    config["PRETRAINED"]["ESM2_DIM"] = train_loader.dataset.protein_dim
-    print(
-        f"Using pre-extracted features: drug_dim={config['PRETRAINED']['CHEMBERT_DIM']}, "
-        f"protein_dim={config['PRETRAINED']['ESM2_DIM']}"
+    set_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_dataset, validation_dataset, test_dataset, target_train_dataset = (
+        build_datasets(args, cfg.DRUG.MAX_NODES)
     )
 
-    model = MAGC_DTI(**config).to(device)
-
-    if config["DA"]["USE"]:
-        discriminator_input_dim = (
-            config["DA"]["RANDOM_DIM"]
-            if config["DA"]["RANDOM_LAYER"]
-            else config["DECODER"]["IN_DIM"]
-        )
-        discriminator = Discriminator(input_size=discriminator_input_dim).to(device)
-
-        if config["DA"]["RANDOM_LAYER"]:
-            if config["DA"]["ORIGINAL_RANDOM"]:
-                random_layer = RandomLayer(
-                    [config["DECODER"]["IN_DIM"], 2],
-                    config["DA"]["RANDOM_DIM"]
-                ).to(device)
-            else:
-                random_layer = nn.Linear(
-                    config["DECODER"]["IN_DIM"] + 2,
-                    config["DA"]["RANDOM_DIM"],
-                    bias=False
-                ).to(device)
-                torch.nn.init.normal_(random_layer.weight, mean=0, std=1)
-                for param in random_layer.parameters():
-                    param.requires_grad = False
-        else:
-            random_layer = None
-
-        optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=config["SOLVER"]["LR"])
-    else:
-        discriminator = None
-        random_layer = None
-        optimizer_d = None
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["SOLVER"]["LR"])
-
-    criterion = ClusterAwareLoss(
-        lambda_cluster=config["DA"]["LAMBDA_CLUSTER"],
-        lambda_domain=config["DA"]["LAMBDA_DOMAIN"],
-        use_cluster_loss=args.use_cluster_loss
-    )
-
-    # Training loop
-    best_auc = 0
-    best_epoch = 0
-    patience = 10
-    patience_counter = 0
-    model_save_path = 'best_model.pth'
-
-    for epoch in range(config["SOLVER"]["MAX_EPOCH"]):
-        print(f"\nEpoch {epoch + 1}/{config['SOLVER']['MAX_EPOCH']}")
-
-        if args.mode == "cross_domain" and config["DA"]["USE"]:
-            train_metrics = train_da_epoch(
-                model, source_loader, target_train_loader, optimizer, criterion, device,
-                discriminator, optimizer_d, epoch, config["DA"]["INIT_EPOCH"],
-                lambda_domain=config["DA"]["LAMBDA_DOMAIN"], random_layer=random_layer,
-                use_entropy=config["DA"]["USE_ENTROPY"]
+    cfg.PRETRAINED.USE_ESM2 = args.use_pretrained_features
+    cfg.PRETRAINED.USE_CHEMBERT = args.use_pretrained_features
+    cfg.PRETRAINED.FEATURE_DIR = args.feature_dir
+    if args.use_pretrained_features:
+        datasets = [train_dataset, validation_dataset, test_dataset]
+        if target_train_dataset is not None:
+            datasets.append(target_train_dataset)
+        drug_dims = {dataset.drug_dim for dataset in datasets}
+        protein_dims = {dataset.protein_dim for dataset in datasets}
+        if (
+            None in drug_dims
+            or None in protein_dims
+            or len(drug_dims) != 1
+            or len(protein_dims) != 1
+        ):
+            raise ValueError(
+                f"Inconsistent feature dimensions: drug={drug_dims}, "
+                f"protein={protein_dims}"
             )
-            print(f"Train - Loss: {train_metrics['loss']:.4f}, AUC: {train_metrics['auc']:.4f}")
-            if epoch >= config["DA"]["INIT_EPOCH"]:
-                print(f"Domain Loss: {train_metrics['domain_loss']:.4f}")
+        cfg.PRETRAINED.CHEMBERT_DIM = drug_dims.pop()
+        cfg.PRETRAINED.ESM2_DIM = protein_dims.pop()
+        print(
+            "Using pre-extracted features: "
+            f"drug_dim={cfg.PRETRAINED.CHEMBERT_DIM}, "
+            f"protein_dim={cfg.PRETRAINED.ESM2_DIM}"
+        )
+
+    train_loader = make_loader(
+        train_dataset,
+        batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+    )
+    validation_loader = make_loader(
+        validation_dataset,
+        batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+    test_loader = make_loader(
+        test_dataset,
+        batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+    target_train_loader = (
+        make_loader(
+            target_train_dataset,
+            batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+        )
+        if target_train_dataset is not None
+        else None
+    )
+
+    model = MAGC_DTI(device=device, **cfg).to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=cfg.SOLVER.LR,
+        weight_decay=cfg.SOLVER.WEIGHT_DECAY,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=cfg.SOLVER.LR_DECAY,
+        patience=max(2, cfg.SOLVER.PATIENCE // 3),
+    )
+    task_criterion = nn.BCEWithLogitsLoss()
+
+    discriminator = None
+    discriminator_optimizer = None
+    if args.mode == "cross_domain":
+        domain_input_dim = cfg.DECODER.IN_DIM * 2
+        discriminator = Discriminator(
+            input_size=domain_input_dim,
+        ).to(device)
+        discriminator_optimizer = torch.optim.Adam(
+            discriminator.parameters(),
+            lr=cfg.SOLVER.LR,
+            weight_decay=cfg.SOLVER.WEIGHT_DECAY,
+        )
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / (
+        "best_da_model.pth"
+        if args.mode == "cross_domain"
+        else "best_model.pth"
+    )
+
+    best_score = -float("inf")
+    best_epoch = 0
+    patience_counter = 0
+    monitor = str(cfg.SOLVER.MONITOR).lower()
+    history = []
+
+    for epoch in range(max_epochs):
+        if args.mode == "cross_domain":
+            train_metrics = train_domain_epoch(
+                model,
+                discriminator,
+                train_loader,
+                target_train_loader,
+                optimizer,
+                discriminator_optimizer,
+                task_criterion,
+                device,
+                epoch,
+                args.da_init_epoch,
+                max_epochs,
+                args.lambda_domain,
+            )
         else:
             train_metrics = train_epoch(
-                model, train_loader, optimizer, criterion, device,
-                discriminator=discriminator, optimizer_d=optimizer_d,
-                epoch=epoch, da_init_epoch=config["DA"]["INIT_EPOCH"],
-                random_layer=random_layer, use_entropy=config["DA"]["USE_ENTROPY"]
+                model,
+                train_loader,
+                optimizer,
+                task_criterion,
+                device,
             )
-            print(f"Train - Loss: {train_metrics['loss']:.4f}, AUC: {train_metrics['auc']:.4f}")
 
-        val_metrics = evaluate(model, valid_loader, criterion, device)
-        print(
-            f"Validation - Loss: {val_metrics['loss']:.4f}, "
-            f"AUC: {val_metrics['auc']:.4f}, "
-            f"AUPRC: {val_metrics['auprc']:.4f}"
+        validation_metrics = evaluate(
+            model,
+            validation_loader,
+            task_criterion,
+            device,
         )
+        score = monitored_score(validation_metrics, monitor)
+        if np.isfinite(score):
+            scheduler.step(score)
 
-        if val_metrics['auc'] > best_auc:
-            best_auc = val_metrics['auc']
+        epoch_record = {
+            "epoch": epoch + 1,
+            "train": train_metrics,
+            "validation": validation_metrics,
+        }
+        history.append(epoch_record)
+        print(
+            f"Epoch {epoch + 1:03d} | "
+            f"train_loss={train_metrics['loss']:.4f} | "
+            f"val_loss={validation_metrics['loss']:.4f} | "
+            f"val_AUROC={validation_metrics['auroc']:.4f} | "
+            f"val_AUPRC={validation_metrics['auprc']:.4f}"
+        )
+        if args.mode == "cross_domain":
+            print(
+                f"  domain_loss={train_metrics['domain_loss']:.4f} | "
+                f"grl_alpha={train_metrics['grl_alpha']:.4f}"
+            )
+
+        if np.isfinite(score) and (
+            best_epoch == 0
+            or score > best_score + cfg.SOLVER.MIN_DELTA
+        ):
+            best_score = score
             best_epoch = epoch + 1
-            model_save_path = 'best_da_model.pth' if args.mode == "cross_domain" else 'best_model.pth'
-            torch.save(model.state_dict(), model_save_path)
-            print(f"New best model saved! AUC: {best_auc:.4f}")
             patience_counter = 0
+            torch.save(model.state_dict(), checkpoint_path)
         else:
             patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch + 1}. No improvement for {patience} epochs.")
+            if patience_counter >= cfg.SOLVER.PATIENCE:
+                print(
+                    f"Early stopping at epoch {epoch + 1}; "
+                    f"best epoch was {best_epoch}."
+                )
                 break
 
-    model.load_state_dict(torch.load(model_save_path))
-    test_metrics = evaluate(model, test_loader, criterion, device)
-
-    print(f"Test results (from epoch {best_epoch}):")
-    print(f"AUC: {test_metrics['auc']:.4f}")
-    print(f"AUPRC: {test_metrics['auprc']:.4f}")
-    print(f"Accuracy: {test_metrics['acc']:.4f}")
-    print(f"Precision: {test_metrics['precision']:.4f}")
-    print(f"Recall: {test_metrics['recall']:.4f}")
-    print(f"Loss: {test_metrics['loss']:.4f}")
-
-    # Cluster-level performance analysis
+    if best_epoch == 0:
+        raise RuntimeError(
+            f"Validation {monitor} was never finite; no model was saved"
+        )
+    model.load_state_dict(load_model_state(checkpoint_path, device))
+    test_metrics = evaluate(model, test_loader, task_criterion, device)
+    result = {
+        "mode": args.mode,
+        "seed": args.seed,
+        "best_epoch": best_epoch,
+        "monitor": monitor,
+        "best_score": best_score,
+        "test": test_metrics,
+        "history": history,
+    }
     if args.analyze_clusters:
-        analyze_cluster_performance(model, test_loader, device)
+        result["cluster_metrics"] = analyze_cluster_performance(
+            model,
+            test_loader,
+            device,
+        )
+
+    result_path = output_dir / "cdan_metrics.json"
+    result_path.write_text(
+        json.dumps(result, indent=2, allow_nan=True),
+        encoding="utf-8",
+    )
+    print(f"Best epoch: {best_epoch}")
+    print(json.dumps(test_metrics, indent=2, allow_nan=True))
+    print(f"Saved model: {checkpoint_path}")
+    print(f"Saved metrics: {result_path}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
