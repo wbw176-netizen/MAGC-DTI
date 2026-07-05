@@ -448,7 +448,6 @@ class MSAA(nn.Module):
         v = self.embedding(v.long())  # [B, seq_len, embedding_dim]
         v = v.transpose(2, 1)  # [B, embedding_dim, seq_len]
         
-        # Eq. (3): FeatureAlign(LayerNorm(MHA(X, X, X) + X)).
         v = self.msafi(v.unsqueeze(-2), mask=mask).squeeze(-2)
         v = v * mask.unsqueeze(1).to(v.dtype)
         
