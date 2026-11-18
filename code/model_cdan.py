@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 import random
 from pathlib import Path
 
@@ -125,8 +124,12 @@ def parse_args():
     parser.add_argument("--max_epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--patience", type=int, default=None)
+    parser.add_argument("--min_delta", type=float, default=None)
+    parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument("--scheduler_patience", type=int, default=5)
     parser.add_argument("--output_dir", default="./results")
-    parser.add_argument("--analyze_clusters", action="store_true")
     return parser.parse_args()
 
 
@@ -391,7 +394,8 @@ def prediction_probabilities(logits):
 def multilinear_condition(features, logits):
     """Return flatten(f_joint outer_product g), exactly as paper Eq. (9)."""
     features = features.flatten(start_dim=1)
-    probabilities = prediction_probabilities(logits)
+    # Match the official CDAN outer-product gradient path.
+    probabilities = prediction_probabilities(logits).detach()
     conditioned = torch.bmm(
         features.unsqueeze(2),
         probabilities.unsqueeze(1),
@@ -616,50 +620,6 @@ def evaluate(model, loader, task_criterion, device):
     )
 
 
-@torch.no_grad()
-def analyze_cluster_performance(model, loader, device):
-    model.eval()
-    results = {"drug": {}, "target": {}}
-    for batch in loader:
-        labels = batch["label"].cpu().numpy()
-        _, logits = forward_batch(model, batch, device)
-        probabilities = torch.sigmoid(logits).cpu().numpy()
-        for kind, key in (
-            ("drug", "drug_cluster"),
-            ("target", "target_cluster"),
-        ):
-            for cluster_id, label, probability in zip(
-                batch[key].numpy(),
-                labels,
-                probabilities,
-            ):
-                if int(cluster_id) < 0:
-                    continue
-                bucket = results[kind].setdefault(
-                    int(cluster_id),
-                    {"labels": [], "probabilities": []},
-                )
-                bucket["labels"].append(float(label))
-                bucket["probabilities"].append(float(probability))
-
-    summary = {"drug": {}, "target": {}}
-    for kind, clusters in results.items():
-        for cluster_id, values in clusters.items():
-            labels = np.asarray(values["labels"])
-            probabilities = np.asarray(values["probabilities"])
-            summary[kind][cluster_id] = {
-                "count": int(labels.size),
-                "auroc": safe_auroc(labels, probabilities),
-                "accuracy": float(
-                    accuracy_score(
-                        labels,
-                        (probabilities >= 0.5).astype(np.int64),
-                    )
-                ),
-            }
-    return summary
-
-
 def build_datasets(args, max_drug_nodes):
     use_features = args.use_pretrained_features
     if args.mode == "cross_domain":
@@ -784,6 +744,30 @@ def main():
     if args.da_init_epoch >= max_epochs and args.mode == "cross_domain":
         raise ValueError("--da_init_epoch must be smaller than max_epochs")
 
+    if args.patience is not None:
+        if args.patience < 1:
+            raise ValueError("patience must be positive")
+        cfg.SOLVER.PATIENCE = args.patience
+    if args.min_delta is not None:
+        if args.min_delta < 0:
+            raise ValueError("min_delta must be nonnegative")
+        cfg.SOLVER.MIN_DELTA = args.min_delta
+    if args.learning_rate is not None:
+        if not np.isfinite(args.learning_rate) or args.learning_rate <= 0:
+            raise ValueError("learning_rate must be finite and positive")
+        cfg.SOLVER.LR = args.learning_rate
+    if args.weight_decay is not None:
+        if not np.isfinite(args.weight_decay) or args.weight_decay < 0:
+            raise ValueError("weight_decay must be finite and nonnegative")
+        cfg.SOLVER.WEIGHT_DECAY = args.weight_decay
+    if args.scheduler_patience < 0:
+        raise ValueError("scheduler_patience must be nonnegative")
+    cfg.SOLVER.SCHEDULER_PATIENCE = args.scheduler_patience
+    cfg.AGICA_CROSS_ATTENTION.NUM_CASCADES = 2
+    cfg.SOLVER.SEED = args.seed
+    cfg.SOLVER.MAX_EPOCH = max_epochs
+    cfg.SOLVER.BATCH_SIZE = batch_size
+    cfg.SOLVER.NUM_WORKERS = num_workers
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_dataset, validation_dataset, test_dataset, target_train_dataset = (
@@ -847,6 +831,9 @@ def main():
     )
 
     model = MAGC_DTI(device=device, **cfg).to(device)
+    if model.agica.num_cascades != 2 or len(model.agica.fusion_modules) != 2:
+        raise RuntimeError("Actual AGICA cascade count must be 2")
+    print("Actual AGICA cascades: " + str(model.agica.num_cascades), flush=True)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=cfg.SOLVER.LR,
@@ -856,7 +843,7 @@ def main():
         optimizer,
         mode="max",
         factor=cfg.SOLVER.LR_DECAY,
-        patience=max(2, cfg.SOLVER.PATIENCE // 3),
+        patience=cfg.SOLVER.SCHEDULER_PATIENCE,
     )
     task_criterion = nn.BCEWithLogitsLoss()
 
@@ -875,6 +862,8 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "config.yaml").write_text(cfg.dump(), encoding="utf-8")
+    (output_dir / "run_args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     checkpoint_path = output_dir / (
         "best_da_model.pth"
         if args.mode == "cross_domain"
@@ -973,13 +962,6 @@ def main():
         "test": test_metrics,
         "history": history,
     }
-    if args.analyze_clusters:
-        result["cluster_metrics"] = analyze_cluster_performance(
-            model,
-            test_loader,
-            device,
-        )
-
     result_path = output_dir / "cdan_metrics.json"
     result_path.write_text(
         json.dumps(result, indent=2, allow_nan=True),
