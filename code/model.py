@@ -585,7 +585,7 @@ class MAGC_DTI(nn.Module):
             self.protein_extractor = MSAA(protein_emb_dim, num_filters, protein_num_head, protein_padding)
             self.feature_extractor = None
 
-        self.agica = AGICA(nf=cross_emb_dim, num_heads=cross_num_head, dropout=cross_dropout_rate, num_cascades=1)
+        self.agica = AGICA(nf=cross_emb_dim, num_heads=cross_num_head, dropout=cross_dropout_rate, num_cascades=2)
 
         self.fusion_weights = nn.Parameter(torch.ones(3) / 3)
 
