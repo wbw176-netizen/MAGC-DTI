@@ -18,7 +18,7 @@ If CUDA or DGL installation fails, install the PyTorch and DGL versions that mat
 ## Downloads
 
 The full datasets files:
-- [Download Datasets (Google Drive)](https://drive.google.com/file/d/11mKoGdp-eeQwcHHGHKkYJ--yirD6IYXF/view?usp=drive_link)
+- [Download Datasets (Google Drive)](https://drive.google.com/file/d/1RkpvU_oKO1lYkj6hj19mXcBIF0kUti3-/view?usp=drive_link)
 
 Download and unzip the dataset files into:
 
